@@ -8,21 +8,47 @@
  * for MySQL connections without modifying WordPress core files.
  */
 
+// Prevent direct access
+if ( ! defined( 'ABSPATH' ) ) {
+    die( 'Direct access not permitted.' );
+}
+
 // Require the standard WordPress database class
 if ( file_exists( ABSPATH . WPINC . '/class-wpdb.php' ) ) {
     require_once( ABSPATH . WPINC . '/class-wpdb.php' );
 } else {
-    // Fallback for older WordPress versions
+    // Fallback for older WordPress versions (pre-6.1)
     require_once( ABSPATH . WPINC . '/wp-db.php' );
 }
 
 /**
  * Extended wpdb class with X.509 SSL certificate support
+ * 
+ * @since 1.0.0
  */
 class wpdb_ssl extends wpdb {
     
     /**
+     * Maximum number of connection retry attempts
+     * 
+     * @var int
+     */
+    private $max_retries = 3;
+    
+    /**
+     * Current retry attempt counter
+     * 
+     * @var int
+     */
+    private $retry_count = 0;
+    
+    /**
      * Constructor - ensures charset/collate are properly initialized
+     * 
+     * @param string $dbuser     Database username
+     * @param string $dbpassword Database password
+     * @param string $dbname     Database name
+     * @param string $dbhost     Database host
      */
     public function __construct( $dbuser, $dbpassword, $dbname, $dbhost ) {
         // Register the database credentials first
@@ -39,7 +65,7 @@ class wpdb_ssl extends wpdb {
     }
     
     /**
-     * Override db_connect to add SSL certificate support
+     * Override db_connect to add SSL certificate support with retry logic
      *
      * @param bool $allow_bail Optional. Allows the function to bail. Default true.
      * @return bool True with a successful connection, false on failure.
@@ -47,7 +73,7 @@ class wpdb_ssl extends wpdb {
     public function db_connect( $allow_bail = true ) {
         $this->is_mysql = true;
 
-        // Suppress mysqli exceptions globally for compatibility
+        // Suppress mysqli exceptions globally for compatibility with poorly coded plugins
         $mysqli_driver = new mysqli_driver();
         $mysqli_driver->report_mode = MYSQLI_REPORT_OFF;
 
@@ -64,11 +90,14 @@ class wpdb_ssl extends wpdb {
             $this->dbh = mysqli_init();
 
             if ( ! $this->dbh ) {
+                $error_msg = 'mysqli_init failed';
+                $this->log_error( $error_msg );
+                
                 if ( $allow_bail ) {
                     wp_load_translations_early();
                     $this->bail( sprintf(
                         __( 'Error establishing a database connection: %s' ),
-                        'mysqli_init failed'
+                        $error_msg
                     ), 'db_connect_fail' );
                 }
                 return false;
@@ -81,15 +110,14 @@ class wpdb_ssl extends wpdb {
             $ssl_capath = defined( 'MYSQL_SSL_CAPATH' ) ? MYSQL_SSL_CAPATH : null;
             $ssl_cipher = defined( 'MYSQL_SSL_CIPHER' ) ? MYSQL_SSL_CIPHER : null;
 
-            // Verify SSL files exist (only log warnings, don't fail)
-            if ( $ssl_ca && ! file_exists( $ssl_ca ) ) {
-                error_log( "WordPress SSL DB: CA file not found at {$ssl_ca}" );
-            }
-            if ( $ssl_cert && ! file_exists( $ssl_cert ) ) {
-                error_log( "WordPress SSL DB: Certificate file not found at {$ssl_cert}" );
-            }
-            if ( $ssl_key && ! file_exists( $ssl_key ) ) {
-                error_log( "WordPress SSL DB: Key file not found at {$ssl_key}" );
+            // Verify SSL files exist before attempting connection
+            if ( ! $this->verify_ssl_files( $ssl_ca, $ssl_cert, $ssl_key ) && $allow_bail ) {
+                wp_load_translations_early();
+                $this->bail(
+                    __( 'Error establishing a database connection: SSL certificate files not found or not readable.' ),
+                    'db_ssl_files_missing'
+                );
+                return false;
             }
 
             // Apply SSL options
@@ -105,8 +133,11 @@ class wpdb_ssl extends wpdb {
             // Set client flags for SSL
             $ssl_flag = MYSQLI_CLIENT_SSL;
             
+            // Handle SSL certificate verification
             if ( defined( 'MYSQL_SSL_VERIFY_SERVER_CERT' ) && MYSQL_SSL_VERIFY_SERVER_CERT === false ) {
+                // Disable server certificate verification (not recommended for production)
                 $ssl_flag |= MYSQLI_CLIENT_SSL_DONT_VERIFY_SERVER_CERT;
+                $this->log_error( 'WARNING: Server certificate verification disabled. This is not recommended for production environments.' );
             }
 
             $client_flags = $client_flags | $ssl_flag;
@@ -125,32 +156,24 @@ class wpdb_ssl extends wpdb {
                 }
             }
             
-            // Attempt real connection
-            $connection_result = mysqli_real_connect(
-                $this->dbh,
+            // Attempt real connection with retry logic
+            $connection_result = $this->attempt_connection(
                 $host,
-                $this->dbuser,
-                $this->dbpassword,
-                null,
                 $port,
                 $socket,
-                $client_flags
+                $client_flags,
+                $allow_bail
             );
 
             if ( ! $connection_result ) {
-                $error = mysqli_connect_error();
-                if ( $allow_bail ) {
-                    wp_load_translations_early();
-                    $this->bail( sprintf(
-                        __( 'Error establishing a database connection: %s' ),
-                        $error
-                    ), 'db_connect_fail' );
-                }
                 return false;
             }
 
             // Select database
             if ( ! mysqli_select_db( $this->dbh, $this->dbname ) ) {
+                $error_msg = sprintf( 'Cannot select database: %s', $this->dbname );
+                $this->log_error( $error_msg );
+                
                 if ( $allow_bail ) {
                     wp_load_translations_early();
                     $this->bail( sprintf(
@@ -173,6 +196,113 @@ class wpdb_ssl extends wpdb {
         } else {
             // Fall back to standard connection (non-SSL)
             return parent::db_connect( $allow_bail );
+        }
+    }
+    
+    /**
+     * Attempt database connection with retry logic
+     * 
+     * @param string $host         Database host
+     * @param int    $port         Database port
+     * @param string $socket       Database socket
+     * @param int    $client_flags Connection flags
+     * @param bool   $allow_bail   Whether to bail on failure
+     * @return bool True on success, false on failure
+     */
+    private function attempt_connection( $host, $port, $socket, $client_flags, $allow_bail ) {
+        for ( $attempt = 0; $attempt <= $this->max_retries; $attempt++ ) {
+            $connection_result = mysqli_real_connect(
+                $this->dbh,
+                $host,
+                $this->dbuser,
+                $this->dbpassword,
+                null,
+                $port,
+                $socket,
+                $client_flags
+            );
+
+            if ( $connection_result ) {
+                if ( $attempt > 0 ) {
+                    $this->log_error( sprintf( 'Database connection succeeded on retry attempt %d', $attempt ) );
+                }
+                return true;
+            }
+
+            // Connection failed
+            $error = mysqli_connect_error();
+            $this->log_error( sprintf(
+                'Database connection attempt %d failed: %s',
+                $attempt + 1,
+                $error
+            ) );
+
+            // If not the last attempt, wait before retrying
+            if ( $attempt < $this->max_retries ) {
+                usleep( 100000 * ( $attempt + 1 ) ); // Progressive backoff: 100ms, 200ms, 300ms
+            }
+        }
+
+        // All retry attempts exhausted
+        $error = mysqli_connect_error();
+        if ( $allow_bail ) {
+            wp_load_translations_early();
+            $this->bail( sprintf(
+                __( 'Error establishing a database connection: %s' ),
+                $error
+            ), 'db_connect_fail' );
+        }
+
+        return false;
+    }
+    
+    /**
+     * Verify SSL certificate files exist and are readable
+     * 
+     * @param string|null $ssl_ca   CA file path
+     * @param string|null $ssl_cert Certificate file path
+     * @param string|null $ssl_key  Key file path
+     * @return bool True if all files are valid, false otherwise
+     */
+    private function verify_ssl_files( $ssl_ca, $ssl_cert, $ssl_key ) {
+        $all_valid = true;
+
+        if ( $ssl_ca && ! $this->is_file_readable( $ssl_ca ) ) {
+            $this->log_error( sprintf( 'SSL CA file not found or not readable: %s', $ssl_ca ) );
+            $all_valid = false;
+        }
+        
+        if ( $ssl_cert && ! $this->is_file_readable( $ssl_cert ) ) {
+            $this->log_error( sprintf( 'SSL certificate file not found or not readable: %s', $ssl_cert ) );
+            $all_valid = false;
+        }
+        
+        if ( $ssl_key && ! $this->is_file_readable( $ssl_key ) ) {
+            $this->log_error( sprintf( 'SSL key file not found or not readable: %s', $ssl_key ) );
+            $all_valid = false;
+        }
+
+        return $all_valid;
+    }
+    
+    /**
+     * Check if a file exists and is readable
+     * 
+     * @param string $filepath File path to check
+     * @return bool True if file exists and is readable
+     */
+    private function is_file_readable( $filepath ) {
+        return file_exists( $filepath ) && is_readable( $filepath );
+    }
+    
+    /**
+     * Log error messages to PHP error log
+     * 
+     * @param string $message Error message to log
+     */
+    private function log_error( $message ) {
+        if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+            error_log( sprintf( '[WordPress SSL DB] %s', $message ) );
         }
     }
     
