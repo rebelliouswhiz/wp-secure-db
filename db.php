@@ -9,7 +9,6 @@
  */
 
 // Require the standard WordPress database class
-// Use class-wpdb.php (wp-db.php is deprecated since WP 6.1.0)
 if ( file_exists( ABSPATH . WPINC . '/class-wpdb.php' ) ) {
     require_once( ABSPATH . WPINC . '/class-wpdb.php' );
 } else {
@@ -23,6 +22,23 @@ if ( file_exists( ABSPATH . WPINC . '/class-wpdb.php' ) ) {
 class wpdb_ssl extends wpdb {
     
     /**
+     * Constructor - ensures charset/collate are properly initialized
+     */
+    public function __construct( $dbuser, $dbpassword, $dbname, $dbhost ) {
+        // Register the database credentials first
+        $this->dbuser = $dbuser;
+        $this->dbpassword = $dbpassword;
+        $this->dbname = $dbname;
+        $this->dbhost = $dbhost;
+
+        // Set up initial charset/collate from DB_CHARSET and DB_COLLATE constants
+        $this->init_charset();
+
+        // Establish database connection (will use SSL if configured)
+        $this->db_connect( false );
+    }
+    
+    /**
      * Override db_connect to add SSL certificate support
      *
      * @param bool $allow_bail Optional. Allows the function to bail. Default true.
@@ -31,8 +47,7 @@ class wpdb_ssl extends wpdb {
     public function db_connect( $allow_bail = true ) {
         $this->is_mysql = true;
 
-        // Suppress mysqli exceptions globally for compatibility with poorly coded plugins
-        // This prevents fatal errors when plugins query non-existent tables
+        // Suppress mysqli exceptions globally for compatibility
         $mysqli_driver = new mysqli_driver();
         $mysqli_driver->report_mode = MYSQLI_REPORT_OFF;
 
@@ -68,13 +83,13 @@ class wpdb_ssl extends wpdb {
 
             // Verify SSL files exist (only log warnings, don't fail)
             if ( $ssl_ca && ! file_exists( $ssl_ca ) ) {
-                error_log( "WordPress SSL DB: CA file not found at {$ssl_ca} - Check file path and permissions" );
+                error_log( "WordPress SSL DB: CA file not found at {$ssl_ca}" );
             }
             if ( $ssl_cert && ! file_exists( $ssl_cert ) ) {
-                error_log( "WordPress SSL DB: Certificate file not found at {$ssl_cert} - Check file path and permissions" );
+                error_log( "WordPress SSL DB: Certificate file not found at {$ssl_cert}" );
             }
             if ( $ssl_key && ! file_exists( $ssl_key ) ) {
-                error_log( "WordPress SSL DB: Key file not found at {$ssl_key} - Check file path and permissions" );
+                error_log( "WordPress SSL DB: Key file not found at {$ssl_key}" );
             }
 
             // Apply SSL options
@@ -90,12 +105,9 @@ class wpdb_ssl extends wpdb {
             // Set client flags for SSL
             $ssl_flag = MYSQLI_CLIENT_SSL;
             
-            // Handle SSL certificate verification
             if ( defined( 'MYSQL_SSL_VERIFY_SERVER_CERT' ) && MYSQL_SSL_VERIFY_SERVER_CERT === false ) {
-                // Disable server certificate verification (not recommended for production)
                 $ssl_flag |= MYSQLI_CLIENT_SSL_DONT_VERIFY_SERVER_CERT;
             }
-            // Default behavior: verify server certificate (secure)
 
             $client_flags = $client_flags | $ssl_flag;
 
@@ -104,7 +116,6 @@ class wpdb_ssl extends wpdb {
             $port = null;
             $socket = null;
             
-            // WordPress may have already parsed this, but let's be explicit
             if ( strpos( $host, ':' ) !== false ) {
                 list( $host, $port_or_socket ) = explode( ':', $host, 2 );
                 if ( is_numeric( $port_or_socket ) ) {
@@ -150,17 +161,40 @@ class wpdb_ssl extends wpdb {
                 return false;
             }
 
+            // Set charset using WordPress built-in method
+            $this->set_charset( $this->dbh );
+            
+            $this->ready = true;
+            $this->set_sql_mode();
+            $this->select( $this->dbname, $this->dbh );
+
+            return true;
+
         } else {
-            // Fall back to standard connection
+            // Fall back to standard connection (non-SSL)
             return parent::db_connect( $allow_bail );
         }
+    }
+    
+    /**
+     * Override init_charset to ensure proper charset/collate initialization
+     * This matches WordPress core behavior
+     */
+    public function init_charset() {
+        if ( function_exists( 'is_multisite' ) && is_multisite() ) {
+            $this->charset = 'utf8';
+            if ( defined( 'DB_COLLATE' ) && DB_COLLATE ) {
+                $this->collate = DB_COLLATE;
+            } else {
+                $this->collate = 'utf8_general_ci';
+            }
+        } elseif ( defined( 'DB_COLLATE' ) ) {
+            $this->collate = DB_COLLATE;
+        }
 
-        $this->set_charset( $this->dbh );
-        $this->ready = true;
-        $this->set_sql_mode();
-        $this->select( $this->dbname, $this->dbh );
-
-        return true;
+        if ( defined( 'DB_CHARSET' ) ) {
+            $this->charset = DB_CHARSET;
+        }
     }
 }
 
