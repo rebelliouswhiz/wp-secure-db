@@ -37,5 +37,5 @@ You might also want to ensure your database user accepts the X509 connection onl
 
 # Known Issues
 
-- It might break some plugin installations, but it should be fine with most.
-- It will break the W3 Total Cache database cache. Please disable it before use.
+- ~~It might break some plugin installations, but it should be fine with most.~~ (Should be fixed)
+- ~~It will break the W3 Total Cache database cache. Please disable it before use.~~ (Should be fixed)
