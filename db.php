@@ -307,6 +307,29 @@ class wpdb_ssl extends wpdb {
     }
     
     /**
+     * Set the SQL mode to a strict and secure default.
+     *
+     * This overrides the parent method to enforce a specific set of SQL modes,
+     * ensuring consistent and strict database behavior.
+     *
+     * @param array $modes Ignored. The modes are hardcoded for security.
+     */
+    public function set_sql_mode( $modes = array() ) {
+        $strict_modes = array(
+            'STRICT_TRANS_TABLES',
+            'NO_ZERO_IN_DATE',
+            'NO_ZERO_DATE',
+            'ERROR_FOR_DIVISION_BY_ZERO',
+            'NO_ENGINE_SUBSTITUTION',
+        );
+        
+        $modes_str = implode( ',', $strict_modes );
+        
+        // Use SESSION to avoid affecting other connections
+        $this->query( "SET SESSION sql_mode = '{$modes_str}'" );
+    }
+    
+    /**
      * Override init_charset to ensure proper charset/collate initialization
      * This matches WordPress core behavior
      */
@@ -327,6 +350,32 @@ class wpdb_ssl extends wpdb {
         }
     }
 }
+
+/**
+ * Allow strict SQL modes for modern database environments.
+ *
+ * By default, WordPress disables certain strict SQL modes. This function removes
+ * specific modes from the "incompatible" list, allowing them to be used.
+ *
+ * @param array $modes List of incompatible SQL modes.
+ * @return array Modified list of incompatible modes.
+ */
+function site_allow_strict_sql_modes($modes) {
+    if (!is_array($modes)) {
+        return array();
+    }
+    
+    // Remove these from the "incompatible" list so WordPress keeps them
+    $allowed_strict_modes = array(
+        'NO_ZERO_DATE',
+        'STRICT_TRANS_TABLES',
+        'NO_ZERO_IN_DATE',
+        'ERROR_FOR_DIVISION_BY_ZERO'
+    );
+    
+    return array_diff($modes, $allowed_strict_modes);
+}
+add_filter('incompatible_sql_modes', 'site_allow_strict_sql_modes');
 
 // Replace the global $wpdb with our extended class
 $wpdb = new wpdb_ssl( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
